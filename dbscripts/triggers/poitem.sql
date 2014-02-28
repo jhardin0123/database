@@ -17,7 +17,7 @@ BEGIN
        (NOT checkPrivilege('PostVouchers')) ) THEN
     RAISE EXCEPTION 'You do not have privileges to alter a Purchase Order.';
   END IF;
-  IF ( ( (TG_OP = 'INSERT') OR (TG_OP = 'DELETE') ) AND (NOT checkPrivilege('MaintainPurchaseOrders')) ) THEN
+  IF ( (TG_OP = 'INSERT') AND (NOT checkPrivilege('MaintainPurchaseOrders')) ) THEN
     RAISE EXCEPTION 'You do not have privileges to alter a Purchase Order.';
   END IF;
 
@@ -148,130 +148,177 @@ BEGIN
     NEW.poitem_qty_returned		:= 0;
     NEW.poitem_qty_vouchered		:= 0;
       
-    PERFORM postEvent('POitemCreate', 'P', NEW.poitem_id,
-                      itemsite_warehous_id,
-                      (pohead_number || '-' || NEW.poitem_linenumber || ': ' || item_number),
-                      NULL, NULL, NULL, NULL)
-    FROM pohead, itemsite, item
-    WHERE (pohead_id=NEW.poitem_pohead_id)
-      AND (itemsite_id=NEW.poitem_itemsite_id)
-      AND (item_id=itemsite_item_id)
-      AND (NEW.poitem_duedate <= (CURRENT_DATE + itemsite_eventfence));
-
   END IF;
 
-  IF ( SELECT (metric_value='t')
-       FROM metric
-       WHERE (metric_name='POChangeLog') ) THEN
-
---  Cache the cmnttype_id for ChangeLog
-    SELECT cmnttype_id INTO _cmnttypeid
-    FROM cmnttype
-    WHERE (cmnttype_name='ChangeLog');
-    IF (FOUND) THEN
-      IF (TG_OP = 'INSERT') THEN
-        PERFORM postComment(_cmnttypeid, 'P', NEW.poitem_pohead_id, ('Created Line #' || NEW.poitem_linenumber::TEXT));
-        PERFORM postComment(_cmnttypeid, 'PI', NEW.poitem_id, 'Created');
-      ELSIF (TG_OP = 'UPDATE') THEN
-        IF (NEW.poitem_qty_ordered <> OLD.poitem_qty_ordered) THEN
-          PERFORM postComment( _cmnttypeid, 'PI', NEW.poitem_id,
-                               ( 'Qty. Ordered Changed from ' || formatQty(OLD.poitem_qty_ordered) ||
-                                 ' to ' || formatQty(NEW.poitem_qty_ordered ) ) );
-        END IF;
-        IF (NEW.poitem_unitprice <> OLD.poitem_unitprice) THEN
-          PERFORM postComment( _cmnttypeid, 'PI', NEW.poitem_id,
-                               ( 'Unit Price Changed from ' || formatPurchPrice(OLD.poitem_unitprice) ||
-                                 ' to ' || formatPurchPrice(NEW.poitem_unitprice ) ) );
-        END IF;
-        IF (NEW.poitem_duedate <> OLD.poitem_duedate) THEN
-          PERFORM postComment( _cmnttypeid, 'PI', NEW.poitem_id,
-                               ( 'Due Date Changed from ' || formatDate(OLD.poitem_duedate) ||
-                                 ' to ' || formatDate(NEW.poitem_duedate ) ) );
-        END IF;
-        IF (COALESCE(OLD.poitem_taxtype_id, -1) <> COALESCE(NEW.poitem_taxtype_id, -1)) THEN
-          PERFORM postComment( _cmnttypeid, 'PI', NEW.poitem_id,
-                               ( 'Tax Type Changed from "' ||
-                                 COALESCE((SELECT taxtype_name FROM taxtype WHERE taxtype_id=OLD.poitem_taxtype_id), 'None') ||
-                                 '" (' || COALESCE(OLD.poitem_taxtype_id, 0) ||
-                                 ') to "' ||
-                                 COALESCE((SELECT taxtype_name FROM taxtype WHERE taxtype_id=NEW.poitem_taxtype_id), 'None') ||
-                                 '" (' || COALESCE(NEW.poitem_taxtype_id, 0) || ')' ) );
-        END IF;
-        IF (NEW.poitem_status <> OLD.poitem_status) THEN
-          IF (NEW.poitem_status = 'C') THEN
-            PERFORM postComment(_cmnttypeid, 'PI', NEW.poitem_id, 'Closed');
-          ELSIF (NEW.poitem_status = 'O') THEN
-            PERFORM postComment(_cmnttypeid, 'PI', NEW.poitem_id, 'Opened');
-          END IF;
-        END IF;
-
-      ELSIF (TG_OP = 'DELETE') THEN
-        PERFORM postComment(_cmnttypeid, 'P', OLD.poitem_pohead_id, ('Deleted Line #' || OLD.poitem_linenumber::TEXT));
-      END IF;
+  IF (TG_OP = 'UPDATE') THEN
+    IF (NEW.poitem_itemsite_id != OLD.poitem_itemsite_id) THEN
+      RAISE EXCEPTION 'You may not change the item site for a line item.';
+    ELSIF (NEW.poitem_expcat_id != OLD.poitem_expcat_id) THEN
+      RAISE EXCEPTION 'You may not change the expense category for a line item.';
     END IF;
   END IF;
 
-  IF (TG_OP = 'DELETE') THEN
-    IF (EXISTS(SELECT recv_id
-               FROM recv
-               WHERE ((recv_order_type='PO')
-                  AND (recv_orderitem_id=OLD.poitem_id)
-                  AND (recv_qty>0)))) THEN
-      RAISE EXCEPTION 'Cannot delete an P/O Item which has been received';
-    END IF;
-
-    DELETE FROM comment
-     WHERE ( (comment_source='PI')
-       AND   (comment_source_id=OLD.poitem_id) );
-
-    DELETE FROM charass
-     WHERE ((charass_target_type='PI')
-       AND  (charass_target_id=OLD.poitem_id));
-
-    IF (OLD.poitem_status = 'O') THEN
-      IF ( (SELECT (count(*) < 1)
-              FROM poitem
-             WHERE ((poitem_pohead_id=OLD.poitem_pohead_id)
-               AND  (poitem_id != OLD.poitem_id)
-               AND  (poitem_status <> 'C')) ) ) THEN
-        UPDATE pohead SET pohead_status = 'C'
-         WHERE ((pohead_id=OLD.poitem_pohead_id)
-           AND  (pohead_status='O'));
-      END IF;
-    END IF;
-
-    RETURN OLD;
-  ELSE
-    IF (TG_OP = 'UPDATE') THEN
-
-      IF (NEW.poitem_itemsite_id != OLD.poitem_itemsite_id) THEN
-        RAISE EXCEPTION 'You may not change the item site for a line item.';
-      ELSIF (NEW.poitem_expcat_id != OLD.poitem_expcat_id) THEN
-        RAISE EXCEPTION 'You may not change the expense category for a line item.';
-      END IF;
-    
-      IF (OLD.poitem_status <> NEW.poitem_status) THEN
-        IF ( (SELECT (count(*) < 1)
-                FROM poitem
-               WHERE ((poitem_pohead_id=NEW.poitem_pohead_id)
-                 AND  (poitem_id != NEW.poitem_id)
-                 AND  (poitem_status<>'C')) ) AND (NEW.poitem_status='C') ) THEN
-          UPDATE pohead SET pohead_status = 'C'
-           WHERE ((pohead_id=NEW.poitem_pohead_id)
-             AND  (pohead_status='O'));
-        ELSE
-          UPDATE pohead SET pohead_status = 'O'
-           WHERE ((pohead_id=NEW.poitem_pohead_id)
-             AND  (pohead_status='C'));
-        END IF;
-      END IF;
-    END IF;
-
-    RETURN NEW;
-  END IF;
+  RETURN NEW;
 
 END;
 $$ LANGUAGE 'plpgsql';
 
 SELECT dropifexists('TRIGGER', 'poitemTrigger');
-CREATE TRIGGER poitemTrigger BEFORE INSERT OR UPDATE OR DELETE ON poitem FOR EACH ROW EXECUTE PROCEDURE _poitemTrigger();
+CREATE TRIGGER poitemTrigger BEFORE INSERT OR UPDATE ON poitem FOR EACH ROW EXECUTE PROCEDURE _poitemTrigger();
+
+CREATE OR REPLACE FUNCTION _poitemAfterTrigger() RETURNS TRIGGER AS $$
+-- Copyright (c) 1999-2014 by OpenMFG LLC, d/b/a xTuple. 
+-- See www.xtuple.com/CPAL for the full text of the software license.
+DECLARE
+  _changelog BOOLEAN := FALSE;
+BEGIN
+
+  IF (TG_OP = 'UPDATE') THEN
+    IF (OLD.poitem_status <> NEW.poitem_status) THEN
+      IF ( (SELECT (count(*) < 1)
+              FROM poitem
+             WHERE ((poitem_pohead_id=NEW.poitem_pohead_id)
+               AND  (poitem_id != NEW.poitem_id)
+               AND  (poitem_status<>'C')) ) AND (NEW.poitem_status='C') ) THEN
+        UPDATE pohead SET pohead_status = 'C'
+         WHERE ((pohead_id=NEW.poitem_pohead_id)
+           AND  (pohead_status='O'));
+      ELSE
+        UPDATE pohead SET pohead_status = 'O'
+         WHERE ((pohead_id=NEW.poitem_pohead_id)
+           AND  (pohead_status='C'));
+      END IF;
+    END IF;
+  END IF;
+
+  IF (TG_OP = 'INSERT') THEN
+    PERFORM postEvent('POitemCreate', 'P', NEW.poitem_id,
+                      itemsite_warehous_id,
+                      (pohead_number || '-' || NEW.poitem_linenumber || ': ' || item_number),
+                      NULL, NULL, NULL, NULL)
+    FROM pohead JOIN itemsite ON (itemsite_id=NEW.poitem_itemsite_id)
+                JOIN item ON (item_id=itemsite_item_id)
+    WHERE (pohead_id=NEW.poitem_pohead_id)
+      AND (NEW.poitem_duedate <= (CURRENT_DATE + itemsite_eventfence));
+  END IF;
+
+  IF ( SELECT fetchMetricBool('POChangeLog') ) THEN
+    _changelog := TRUE;
+  END IF;
+
+  IF ( _changelog ) THEN
+    IF (TG_OP = 'INSERT') THEN
+      PERFORM postComment('ChangeLog', 'P', NEW.poitem_pohead_id, ('Created Line #' || NEW.poitem_linenumber::TEXT));
+      PERFORM postComment('ChangeLog', 'PI', NEW.poitem_id, 'Created');
+
+    ELSIF (TG_OP = 'UPDATE') THEN
+      IF (NEW.poitem_qty_ordered <> OLD.poitem_qty_ordered) THEN
+        PERFORM postComment( 'ChangeLog', 'PI', NEW.poitem_id,
+                             ( 'Qty. Ordered Changed from ' || formatQty(OLD.poitem_qty_ordered) ||
+                               ' to ' || formatQty(NEW.poitem_qty_ordered ) ) );
+      END IF;
+      IF (NEW.poitem_unitprice <> OLD.poitem_unitprice) THEN
+        PERFORM postComment( 'ChangeLog', 'PI', NEW.poitem_id,
+                             ( 'Unit Price Changed from ' || formatPurchPrice(OLD.poitem_unitprice) ||
+                               ' to ' || formatPurchPrice(NEW.poitem_unitprice ) ) );
+      END IF;
+      IF (NEW.poitem_duedate <> OLD.poitem_duedate) THEN
+        PERFORM postComment( 'ChangeLog', 'PI', NEW.poitem_id,
+                             ( 'Due Date Changed from ' || formatDate(OLD.poitem_duedate) ||
+                               ' to ' || formatDate(NEW.poitem_duedate ) ) );
+      END IF;
+      IF (COALESCE(OLD.poitem_taxtype_id, -1) <> COALESCE(NEW.poitem_taxtype_id, -1)) THEN
+        PERFORM postComment( 'ChangeLog', 'PI', NEW.poitem_id,
+                             ( 'Tax Type Changed from "' ||
+                               COALESCE((SELECT taxtype_name FROM taxtype WHERE taxtype_id=OLD.poitem_taxtype_id), 'None') ||
+                               '" (' || COALESCE(OLD.poitem_taxtype_id, 0) ||
+                               ') to "' ||
+                               COALESCE((SELECT taxtype_name FROM taxtype WHERE taxtype_id=NEW.poitem_taxtype_id), 'None') ||
+                               '" (' || COALESCE(NEW.poitem_taxtype_id, 0) || ')' ) );
+      END IF;
+      IF (NEW.poitem_status <> OLD.poitem_status) THEN
+        IF (NEW.poitem_status = 'C') THEN
+          PERFORM postComment('ChangeLog', 'PI', NEW.poitem_id, 'Closed');
+        ELSIF (NEW.poitem_status = 'O') THEN
+          PERFORM postComment('ChangeLog', 'PI', NEW.poitem_id, 'Opened');
+        END IF;
+      END IF;
+
+    END IF;
+  END IF;
+
+  RETURN NEW;
+
+END;
+$$ LANGUAGE 'plpgsql';
+
+SELECT dropifexists('TRIGGER', 'poitemAfterTrigger');
+CREATE TRIGGER poitemAfterTrigger AFTER INSERT OR UPDATE ON poitem FOR EACH ROW EXECUTE PROCEDURE _poitemAfterTrigger();
+
+CREATE OR REPLACE FUNCTION _poitemDeleteTrigger() RETURNS TRIGGER AS $$
+-- Copyright (c) 1999-2014 by OpenMFG LLC, d/b/a xTuple. 
+-- See www.xtuple.com/CPAL for the full text of the software license.
+DECLARE
+BEGIN
+
+  IF (NOT checkPrivilege('MaintainPurchaseOrders')) THEN
+    RAISE EXCEPTION 'You do not have privileges to alter a Purchase Order.';
+  END IF;
+
+  IF (EXISTS(SELECT recv_id
+             FROM recv
+             WHERE ((recv_order_type='PO')
+                AND (recv_orderitem_id=OLD.poitem_id)
+                AND (recv_qty>0)))) THEN
+    RAISE EXCEPTION 'Cannot delete an P/O Item which has been received';
+  END IF;
+
+  DELETE FROM comment
+   WHERE ( (comment_source='PI')
+     AND   (comment_source_id=OLD.poitem_id) );
+
+  DELETE FROM charass
+   WHERE ((charass_target_type='PI')
+     AND  (charass_target_id=OLD.poitem_id));
+
+  RETURN OLD;
+
+END;
+$$ LANGUAGE 'plpgsql';
+
+SELECT dropifexists('TRIGGER', 'poitemDeleteTrigger');
+CREATE TRIGGER poitemDeleteTrigger BEFORE DELETE ON poitem FOR EACH ROW EXECUTE PROCEDURE _poitemDeleteTrigger();
+
+CREATE OR REPLACE FUNCTION _poitemAfterDeleteTrigger() RETURNS TRIGGER AS $$
+-- Copyright (c) 1999-2014 by OpenMFG LLC, d/b/a xTuple. 
+-- See www.xtuple.com/CPAL for the full text of the software license.
+DECLARE
+  _changelog BOOLEAN := FALSE;
+BEGIN
+
+  IF (OLD.poitem_status = 'O') THEN
+    IF ( (SELECT (count(*) < 1)
+            FROM poitem
+           WHERE ((poitem_pohead_id=OLD.poitem_pohead_id)
+             AND  (poitem_id != OLD.poitem_id)
+             AND  (poitem_status <> 'C')) ) ) THEN
+      UPDATE pohead SET pohead_status = 'C'
+       WHERE ((pohead_id=OLD.poitem_pohead_id)
+         AND  (pohead_status='O'));
+    END IF;
+  END IF;
+
+  IF ( SELECT fetchMetricBool('POChangeLog') ) THEN
+    _changelog := TRUE;
+  END IF;
+
+  IF ( _changelog ) THEN
+    PERFORM postComment('ChangeLog', 'P', OLD.poitem_pohead_id, ('Deleted Line #' || OLD.poitem_linenumber::TEXT));
+  END IF;
+
+  RETURN OLD;
+END;
+$$ LANGUAGE 'plpgsql';
+
+SELECT dropifexists('TRIGGER', 'poitemAfterDeleteTrigger');
+CREATE TRIGGER poitemAfterDeleteTrigger AFTER DELETE ON poitem FOR EACH ROW EXECUTE PROCEDURE _poitemAfterDeleteTrigger();
